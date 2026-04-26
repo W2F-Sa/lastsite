@@ -1,6 +1,6 @@
 {
     "version": 2,
-    "name": "v-rust-tunnel",
+    "name": "vercel-xhttp-relay",
     "rewrites": [
       { "source": "/(.*)", "destination": "/api/index" }
     ],
