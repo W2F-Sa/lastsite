@@ -1,26 +1,28 @@
-// Single Edge Function that does two things:
+// Single Edge Function. Routes traffic to one of three places:
 //
-//   1. Streams XHTTP traffic from an Xray client through this Vercel
-//      deployment to a real Xray backend (TARGET_DOMAIN).
+//   1. Real Xray XHTTP requests (POST /<prefix>/<session>/up, GET
+//      /<prefix>/<session>) → streamed to TARGET_DOMAIN.
 //
-//   2. Serves a complete, realistic personal website on every other URL
-//      so a passive observer, a casual browser, an active prober, or a
-//      crawler all see what looks like a normal developer portfolio
-//      hosted on Vercel — instead of a blank function.
+//   2. Other requests under /<prefix>/* → handled by a believable JSON
+//      "threads" REST API. From the outside the prefix looks like a
+//      normal API surface with discoverable endpoints, OpenAPI shape,
+//      and proper status codes — not a tunnel.
 //
-// The proxy path is configurable via the PROXY_PATH env var (default
-// "/abc2", to match the deployed Xray inbound). A request only takes the
-// proxy code path if it has a non-empty session segment after that
-// prefix (e.g. /abc2/<session-id>) — bare /abc2 hits return the normal
-// site 404, which is exactly what a real site would return.
+//   3. Everything else → realistic developer-portfolio website.
+//
+// The classification logic in lib/site/api_threads.js is conservative:
+// any request that doesn't match the canonical Xray XHTTP shape (write
+// method, or GET with non-HTML accept, plus a session-id-shaped first
+// segment) falls through to the camouflage API. Real clients always
+// match; probes almost never do.
 
-export const config = {
-  runtime: "edge",
-  // Vercel passes through whatever regions are configured; "auto"
-  // keeps the existing geographic distribution.
-};
+export const config = { runtime: "edge" };
 
-import { relayToUpstream } from "../lib/proxy.js";
+import { relayToUpstream, apiError } from "../lib/proxy.js";
+import {
+  classifyProxyRequest,
+  handleCamouflage,
+} from "../lib/site/api_threads.js";
 import {
   homePage,
   aboutPage,
@@ -62,52 +64,41 @@ function normalizePath(p) {
 }
 
 function getPath(req) {
-  // Avoid a `new URL(req.url)` allocation on the hot path.
   const i = req.url.indexOf("/", 8);
   if (i === -1) return "/";
   const q = req.url.indexOf("?", i);
   return q === -1 ? req.url.slice(i) : req.url.slice(i, q);
 }
 
-function isProxyRequest(path) {
-  if (path === PROXY_PATH) return false;
-  if (path.length <= PROXY_PATH.length) return false;
-  if (!path.startsWith(PROXY_PATH)) return false;
-  if (path.charCodeAt(PROXY_PATH.length) !== 47 /* '/' */) return false;
-  // require a non-empty session segment after the prefix
-  return path.length > PROXY_PATH.length + 1;
-}
-
 export default async function handler(req) {
+  const t0 = Date.now();
   const path = getPath(req);
 
-  // -------------- proxy fast-path --------------
-  if (TARGET_BASE && isProxyRequest(path)) {
-    try {
-      return await relayToUpstream(req, TARGET_BASE);
-    } catch (err) {
-      // Fail closed but with a generic-looking response, never leak
-      // anything that hints at a proxy. From a prober's perspective
-      // this should look the same as a flaky CDN.
-      return new Response("Bad Gateway", {
-        status: 502,
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-          "cache-control": "no-store",
-        },
-      });
+  // ------- proxy fast-path + camouflage on the same prefix -------
+  if (path === PROXY_PATH || path.startsWith(PROXY_PATH + "/")) {
+    if (TARGET_BASE) {
+      const verdict = classifyProxyRequest(path, PROXY_PATH, req);
+      if (verdict.isProxy) {
+        try {
+          return await relayToUpstream(req, TARGET_BASE);
+        } catch {
+          // Match the JSON-shaped error envelope the camouflage API
+          // emits, so a probe that races a real client can't see two
+          // different error shapes from the same path.
+          return apiError(503, "service_unavailable", "Origin temporarily unreachable.", t0);
+        }
+      }
     }
+    return handleCamouflage(path, PROXY_PATH, req, t0);
   }
 
-  // -------------- decoy site --------------
+  // ------- decoy site -------
   return await routeSite(req, path);
 }
 
 async function routeSite(req, path) {
   const method = req.method;
 
-  // Only allow GET/HEAD/POST through the site router. Anything weirder
-  // gets the same 405 a real Next.js site would return.
   if (method !== "GET" && method !== "HEAD" && method !== "POST") {
     return new Response("Method Not Allowed", {
       status: 405,
@@ -115,7 +106,6 @@ async function routeSite(req, path) {
     });
   }
 
-  // Static-ish assets first (these can hit on HEAD too).
   switch (path) {
     case "/robots.txt": return robotsTxt(req);
     case "/sitemap.xml": return sitemapXml(req);
@@ -140,14 +130,12 @@ async function routeSite(req, path) {
     case "/assets/app.js": return appJs();
   }
 
-  // JSON APIs — these use POST in some cases.
   if (path === "/api/ping" && method === "POST") return apiPing(req);
   if (path === "/api/contact" && method === "POST") return apiContact(req);
   if (path === "/api/views" && (method === "GET" || method === "HEAD")) return apiViews(req);
   if (path === "/api/health" && (method === "GET" || method === "HEAD")) return apiHealth();
   if (path === "/api/posts" && (method === "GET" || method === "HEAD")) return apiPosts();
 
-  // The HTML site. POSTs to non-API URLs become 405.
   if (method === "POST") {
     return new Response("Method Not Allowed", {
       status: 405,
