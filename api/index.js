@@ -21,7 +21,7 @@
 //
 // Defaults are baked in — ZONE and ROUTE only need to be overridden
 // via env vars if the operator wants to point at a different origin
-// or change the route prefix.
+// or chang1e the route prefix.
 
 export const config = {
   api: {
